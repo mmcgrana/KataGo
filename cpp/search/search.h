@@ -411,6 +411,18 @@ struct Search {
     nlohmann::json& ret
   ) const;
 
+  //Policy queries: for each requested profile, compute the raw NN policy at the current root position
+  //(set via setPosition) WITHOUT any tree search. superhuman[i]==true uses the main net (humanProfiles[i]
+  //ignored); otherwise the human net is evaluated with humanProfiles[i]. Only the nets actually needed are
+  //evaluated. policies[i] is filled with the net's policy (length NNPos::MAX_NN_POLICY_SIZE), the same
+  //values the analysis "policy"/"humanPolicy" fields report. rootNumSymmetriesToSample/nnPolicyTemperature
+  //etc. from the current search params apply. The available search threads are used to evaluate concurrently.
+  void computeProfilePolicies(
+    const std::vector<bool>& superhuman,
+    const std::vector<SGFMetadata>& humanProfiles,
+    std::vector<std::vector<float>>& policies
+  );
+
 
   //================================================================================================================
   // HELPER FUNCTIONS FOR THE SEARCH

@@ -34,6 +34,77 @@ void Search::computeRootNNEvaluation(NNResultBuf& nnResultBuf, bool includeOwner
   );
 }
 
+void Search::computeProfilePolicies(
+  const std::vector<bool>& superhuman,
+  const std::vector<SGFMetadata>& humanProfiles,
+  std::vector<std::vector<float>>& policies
+) {
+  const int n = (int)superhuman.size();
+  policies.assign((size_t)n, std::vector<float>());
+
+  //Each requested profile is an independent NN evaluation; hand them out to the search threads via a
+  //work-stealing counter so they run concurrently and fill the GPU batch.
+  std::atomic<int> nextIdx(0);
+  std::function<void(int)> task = [&](int threadIdx) {
+    (void)threadIdx;
+    Rand rand;
+    NNResultBuf nnResultBuf;
+    while(true) {
+      int i = nextIdx.fetch_add(1, std::memory_order_relaxed);
+      if(i >= n)
+        break;
+
+      MiscNNInputParams nnInputParams;
+      nnInputParams.drawEquivalentWinsForWhite = searchParams.drawEquivalentWinsForWhite;
+      nnInputParams.conservativePassAndIsRoot = searchParams.conservativePass;
+      nnInputParams.enablePassingHacks = searchParams.enablePassingHacks;
+      nnInputParams.nnPolicyTemperature = searchParams.nnPolicyTemperature;
+      nnInputParams.avoidMYTDaggerHack = searchParams.avoidMYTDaggerHackPla == rootPla;
+      nnInputParams.policyOptimism = searchParams.rootPolicyOptimism;
+      if(searchParams.playoutDoublingAdvantage != 0) {
+        Player playoutDoublingAdvantagePla = getPlayoutDoublingAdvantagePla();
+        nnInputParams.playoutDoublingAdvantage = (
+          getOpp(rootPla) == playoutDoublingAdvantagePla ? -searchParams.playoutDoublingAdvantage : searchParams.playoutDoublingAdvantage
+        );
+      }
+      if(searchParams.ignorePreRootHistory || searchParams.ignoreAllHistory)
+        nnInputParams.maxHistory = 0;
+
+      //superhuman -> main net (humanProfiles[i] unused); otherwise human net with the requested profile.
+      NNEvaluator* evaluator = superhuman[i] ? nnEvaluator : humanEvaluator;
+      const SGFMetadata* sgfMeta = superhuman[i] ? &searchParams.humanSLProfile : &humanProfiles[(size_t)i];
+
+      const NNOutput* out = NULL;
+      std::shared_ptr<NNOutput>* symResult = NULL;
+      const bool includeOwnerMap = false;
+      if(searchParams.rootNumSymmetriesToSample > 1) {
+        symResult = evaluator->averageMultipleSymmetries(
+          rootBoard, rootHistory, rootPla, sgfMeta, nnInputParams,
+          nnResultBuf, includeOwnerMap, rand, searchParams.rootNumSymmetriesToSample
+        );
+        out = symResult->get();
+      }
+      else {
+        evaluator->evaluate(
+          rootBoard, rootHistory, rootPla, sgfMeta, nnInputParams,
+          nnResultBuf, false, includeOwnerMap
+        );
+        out = nnResultBuf.result.get();
+      }
+
+      const float* probs = out->getPolicyProbsMaybeNoised();
+      std::vector<float>& dst = policies[(size_t)i];
+      dst.resize(NNPos::MAX_NN_POLICY_SIZE);
+      for(int p = 0; p < NNPos::MAX_NN_POLICY_SIZE; p++)
+        dst[(size_t)p] = probs[p];
+
+      if(symResult != NULL)
+        delete symResult;
+    }
+  };
+  performTaskWithThreads(&task, 0x3fffFFFF);
+}
+
 bool Search::needsHumanOutputAtRoot() const {
   return humanEvaluator != NULL && (searchParams.humanSLProfile.initialized || !humanEvaluator->requiresSGFMetadata());
 }

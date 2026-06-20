@@ -5,6 +5,8 @@
 #include "../core/makedir.h"
 #include "../search/asyncbot.h"
 #include "../search/patternbonustable.h"
+#include "../neuralnet/nninputs.h"
+#include "../neuralnet/sgfmetadata.h"
 #include "../program/setup.h"
 #include "../program/playutils.h"
 #include "../program/play.h"
@@ -44,6 +46,13 @@ struct AnalyzeRequest {
 
   vector<int> avoidMoveUntilByLocBlack;
   vector<int> avoidMoveUntilByLocWhite;
+
+  //Policy query: if non-empty, this request returns raw NN policies (no search). policyProfiles are the
+  //requested profile keys (also the output map keys); policySuperhuman[i]/policyHumanProfiles[i] are the
+  //resolved per-profile evaluation target (main net vs human net + profile).
+  vector<string> policyProfiles;
+  vector<bool> policySuperhuman;
+  vector<SGFMetadata> policyHumanProfiles;
 
   //Starts with STATUS_IN_QUEUE.
   //Thread that grabs it from queue it changes it to STATUS_POPPED
@@ -342,7 +351,7 @@ int MainCmds::analysis(const vector<string>& args) {
   }
 
   auto analysisLoop = [
-    &logger,&toAnalyzeQueue,&reportAnalysis,&reportNoAnalysis,&logSearchInfo,&nnEval,&openRequestsMutex,&openRequests
+    &logger,&toAnalyzeQueue,&reportAnalysis,&reportNoAnalysis,&logSearchInfo,&nnEval,&openRequestsMutex,&openRequests,&pushToWrite
   ](AsyncBot* bot, int threadIdx) {
     while(true) {
       std::pair<std::pair<int64_t,int64_t>,AnalyzeRequest*> analysisItem;
@@ -361,6 +370,53 @@ int MainCmds::analysis(const vector<string>& args) {
         bot->setAlwaysIncludeOwnerMap(request->includeOwnership || request->includeOwnershipStdev || request->includeMovesOwnership || request->includeMovesOwnershipStdev);
         bot->setParams(request->params);
         bot->setAvoidMoveUntilByLoc(request->avoidMoveUntilByLocBlack,request->avoidMoveUntilByLocWhite);
+
+        //Policy query: only NN evaluations, no search. Returns one or more named policy arrays.
+        if(!request->policyProfiles.empty()) {
+          int expectedStatus = AnalyzeRequest::STATUS_POPPED;
+          //Claim the request (mirrors onSearchBegun). If it was terminated first, skip; the terminate
+          //handler is responsible for writing in that case.
+          if(request->status.compare_exchange_strong(expectedStatus, threadIdx, std::memory_order_acq_rel)) {
+            vector<vector<float>> policies;
+            bot->getSearchStopAndWait()->computeProfilePolicies(
+              request->policySuperhuman, request->policyHumanProfiles, policies
+            );
+            json ret;
+            ret["id"] = request->id;
+            ret["turnNumber"] = request->turnNumber;
+            json policiesJson = json::object();
+            const int nnXLen = nnEval->getNNXLen();
+            const int nnYLen = nnEval->getNNYLen();
+            const int xSize = request->board.x_size;
+            const int ySize = request->board.y_size;
+            for(size_t k = 0; k < request->policyProfiles.size(); k++) {
+              const vector<float>& probs = policies[k];
+              json arr = json::array();
+              for(int y = 0; y < ySize; y++) {
+                for(int x = 0; x < xSize; x++) {
+                  int pos = NNPos::xyToPos(x, y, nnXLen);
+                  arr.push_back(Global::roundDynamic((double)probs[(size_t)pos], 8));
+                }
+              }
+              int passPos = NNPos::locToPos(Board::PASS_LOC, xSize, nnXLen, nnYLen);
+              arr.push_back(Global::roundDynamic((double)probs[(size_t)passPos], 8));
+              policiesJson[request->policyProfiles[k]] = arr;
+            }
+            ret["policies"] = policiesJson;
+            pushToWrite(new string(ret.dump()));
+          }
+          else {
+            //Terminated before we claimed it; still write something to honor the API guarantee.
+            reportNoAnalysis(request);
+          }
+          bot->clearSearch();
+          {
+            std::lock_guard<std::mutex> lock(openRequestsMutex);
+            openRequests.erase(request->internalId);
+          }
+          delete request;
+          continue;
+        }
 
         Player pla = request->nextPla;
         double searchFactor = 1.0;
@@ -1051,6 +1107,56 @@ int MainCmds::analysis(const vector<string>& args) {
           continue;
         rbase.reportDuringSearch = true;
       }
+      if(input.find("policyProfiles") != input.end()) {
+        vector<string> profs;
+        try {
+          profs = input["policyProfiles"].get<vector<string>>();
+        }
+        catch(...) {
+          reportErrorForId(rbase.id, "policyProfiles", "Must be an array of profile name strings");
+          continue;
+        }
+        if(profs.size() <= 0) {
+          reportErrorForId(rbase.id, "policyProfiles", "Must be a non-empty array of profile names");
+          continue;
+        }
+        if(rbase.reportDuringSearch) {
+          reportErrorForId(rbase.id, "policyProfiles", "reportDuringSearchEvery is not supported for policy queries");
+          continue;
+        }
+        bool failed = false;
+        vector<bool> superhuman;
+        vector<SGFMetadata> humanProfiles;
+        for(size_t pi = 0; pi < profs.size(); pi++) {
+          const string& prof = profs[pi];
+          if(prof == "superhuman") {
+            superhuman.push_back(true);
+            humanProfiles.push_back(SGFMetadata());
+          }
+          else {
+            if(humanEval == NULL) {
+              reportErrorForId(rbase.id, "policyProfiles", "Human profile '" + prof + "' requested but no -human-model is loaded");
+              failed = true;
+              break;
+            }
+            try {
+              SGFMetadata md = SGFMetadata::getProfile(prof);
+              superhuman.push_back(false);
+              humanProfiles.push_back(md);
+            }
+            catch(const StringError&) {
+              reportErrorForId(rbase.id, "policyProfiles", "Unknown profile '" + prof + "' (use \"superhuman\" or a humanSLProfile such as \"rank_9d\")");
+              failed = true;
+              break;
+            }
+          }
+        }
+        if(failed)
+          continue;
+        rbase.policyProfiles = profs;
+        rbase.policySuperhuman = superhuman;
+        rbase.policyHumanProfiles = humanProfiles;
+      }
       if(input.find("priority") != input.end()) {
         if(input.find("priorities") != input.end()) {
           reportErrorForId(rbase.id, "priority", "Cannot specify both priority and priorities");
@@ -1189,6 +1295,9 @@ int MainCmds::analysis(const vector<string>& args) {
           newRequest->priority = priority;
           newRequest->avoidMoveUntilByLocBlack = rbase.avoidMoveUntilByLocBlack;
           newRequest->avoidMoveUntilByLocWhite = rbase.avoidMoveUntilByLocWhite;
+          newRequest->policyProfiles = rbase.policyProfiles;
+          newRequest->policySuperhuman = rbase.policySuperhuman;
+          newRequest->policyHumanProfiles = rbase.policyHumanProfiles;
           newRequest->status.store(AnalyzeRequest::STATUS_IN_QUEUE,std::memory_order_release);
           newRequests.push_back(newRequest);
         }

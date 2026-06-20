@@ -534,3 +534,48 @@ This kind of setting could be interesting for handicap games or trying to elicit
 * Set `useUncertainty` to `false` and `subtreeValueBiasFactor` to `0.0` and `useNoisePruning` to `false` (important, disables a few search features that add strength but are highly likely to interfere with this kind of weightful biasing).
    * Setting `useNoisePruning` to `false` is probably the most important of these - it adds the least strength in normal usage but might interfere the most. One could experiment with still enabling the other two for strength.
 
+## Policy Queries
+
+A *policy query* asks only for the neural net's raw policy (move prediction) for one or more "profiles" at a position, with **no tree search**. It is intended for cheaply producing policy arrays in bulk — e.g. the move predictions of several human ranks plus the raw superhuman net for every position of a game.
+
+A query is handled as a policy query when it contains a non-empty `policyProfiles` field. In this mode KataGo performs **only the neural net evaluations required by the requested profiles** — no search, no value, no move selection — and returns the policy arrays.
+
+### Query
+
+A policy query accepts the same position-describing and policy-affecting fields as a normal analysis query, plus `policyProfiles`:
+
+```json
+{"id":"foo","moves":[["B","Q4"],["W","D4"]],"rules":"japanese","komi":6.5,"boardXSize":19,"boardYSize":19,"analyzeTurns":[0,1,2],"policyProfiles":["superhuman","rank_20k","rank_1d"]}
+```
+
+* `policyProfiles (list of strings)`: Required, and its presence marks the query as a policy query. One or more profile keys to return policy for. Each key is one of:
+   * `"superhuman"` — the raw policy of the main neural net (the `-model` net); identical to the values the normal analysis `policy` field would return.
+   * any `humanSLProfile` string (`rank_20k`..`rank_9d`, `preaz_*`, `proyear_*`, and the `_{BR}_{WR}` forms; see the `humanSLProfile` documentation above) — the policy of the human SL net (the `-human-model` net) for that profile; identical to the values the normal `humanPolicy` field would return when that profile is set.
+   * Duplicate keys are evaluated once per net call; key order does not matter.
+* Accepted position/policy fields, with the same meaning as in a normal query: `id`, `moves`, `initialStones`, `initialPlayer`, `rules`, `komi`, `whiteHandicapBonus`, `boardXSize`, `boardYSize`, `analyzeTurns`, `rootPolicyTemperature`, `priority`, `priorities`, and `overrideSettings` (notably `rootNumSymmetriesToSample` and `rootSymmetryPruning`, which affect the policy exactly as for normal queries).
+* `humanSLProfile` in `overrideSettings` is ignored for a policy query — the human profiles to evaluate are given by `policyProfiles` instead.
+* Fields that only affect tree search or non-policy outputs are ignored, since a policy query does no search: `maxVisits`, `maxPlayouts`, `analysisPVLen`, `rootFpuReductionMax`, `includePolicy`, `includeOwnership*`, `includeMovesOwnership*`, `includePVVisits`, `includeNoResultValue`, `avoidMoves`, `allowMoves`, `forceVisits`.
+* `reportDuringSearchEvery` and `firstReportDuringSearchAfter` are **not** accepted; specifying either produces an error (a policy query has no search to report on).
+
+### Execution and cost
+
+* Each analyzed turn is handled by a single analysis thread, the same as a normal query.
+* Only the neural net evaluations actually required are performed:
+   * the main net is evaluated only if `"superhuman"` is requested;
+   * the human net is evaluated once per requested human profile.
+   * E.g. a query for only human-rank profiles never touches the main (superhuman) net.
+* The required evaluations for a turn (one main-net eval if requested, plus one human-net eval per requested human profile, each repeated `rootNumSymmetriesToSample` times if symmetry sampling is on) are distributed across the available search threads of the handling analysis thread, so they run concurrently.
+
+### Response
+
+A policy query produces one response per analyzed turn:
+
+```json
+{"id":"foo","turnNumber":2,"policies":{"superhuman":[ ... ],"rank_20k":[ ... ],"rank_1d":[ ... ]}}
+```
+
+* `id`: The same id string provided on the query.
+* `turnNumber`: The turn analyzed (present per turn when `analyzeTurns` requests several).
+* `policies`: A JSON object with one entry per requested profile key. Each value is a policy array in the **same format as the analysis `policy` field**: length `boardYSize * boardXSize + 1`, non-negative values summing to 1 with `-1` for illegal moves, in row-major order from the top-left (e.g. A19) to the bottom-right (e.g. T1), with the last element being the pass policy. `policies["superhuman"]` matches the normal `policy` field; `policies["<profile>"]` matches the normal `humanPolicy` field for that profile.
+
+Errors use the same format as normal queries (see "Responses"). An unknown profile key, a human profile requested with no `-human-model` loaded, an empty `policyProfiles`, or a disallowed field (e.g. `reportDuringSearchEvery`) produces an error response for that query.
