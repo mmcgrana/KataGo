@@ -101,6 +101,9 @@ Explanation of fields (including some optional fields not present in the above q
       * `untilDepth` - a positive integer, indicating the ply such that moves are prohibited before that ply.
       * Multiple dicts can specify different `untilDepth` for different sets of moves. The behavior is unspecified if a move is specified more than once with different `untilDepth`.
    * `allowMoves (list of dicts)`: Optional. Same as `avoidMoves` except prohibits all moves EXCEPT the moves specified. Currently, the list of dicts must also be length 1.
+   * `forceVisits (list of dicts)`: Optional. Require that specific root moves each receive at least a minimum number of visits, even if the search would not naturally explore them, and without biasing the root evaluation. See the section ["Forcing Minimum Visits to Specific Moves"](#forcing-minimum-visits-to-specific-moves) below for the exact scheduling and effect on the visit fields. Each dict must contain:
+      * `player` - the player to move at the analyzed turn, `"B"` or `"W"`. Forcing applies only to root moves, so this must be the side to move; entries for the other player have no effect.
+      * `moves` - an object mapping each move location (e.g. `"Q13"`, `"pass"`) to the minimum number of visits to force for that move, a positive integer. Example: `{"Q13":3,"R14":10}`. Moves that are illegal at the analyzed position are ignored.
    * `overrideSettings (object)`: Optional. Specify any number of `"paramName":value` entries in this object to override those params from command line `CONFIG_FILE` for this query. Most search parameters can be overriden: `cpuctExploration`, `winLossUtilityFactor`, etc. Some notable parameters include:
       * `playoutDoublingAdvantage (float)`. A value of PDA from -3 to 3 will adjust KataGo's evaluation to assume that the opponent is NOT of equal strength/compte, but rather that the current player has 2^(PDA) times as many playouts as the opponent. Dynamic versions of this are used to significant effect in handicap games in GTP mode, see [GTP example config](../cpp/configs/gtp_example.cfg).
       * `wideRootNoise (float)`. See documentation for this parameter in [the example config](../cpp/configs/analysis_example.cfg)
@@ -237,7 +240,7 @@ Current fields are:
    * `moveInfos`: A list of JSON dictionaries, one per move that KataGo considered, with fields indicating the results of analysis. Current fields are:
       * `move` - The move being analyzed.
       * `visits` - The number of visits that the child node received.
-      * `edgeVisits` - The number of visits that the root node "wants" to invest in the move, due to thinking it's a plausible or search-worthy move. Might differ from `visits` due to human SL weightless exploration, or graph search transpositions.
+      * `edgeVisits` - The number of visits that the root node "wants" to invest in the move, due to thinking it's a plausible or search-worthy move. Might differ from `visits` due to human SL weightless exploration, forced visits (see `forceVisits`), or graph search transpositions.
       * `winrate` - The winrate of the move, as a float in [0,1].
       * `scoreMean` - Same as scoreLead. "Mean" is a slight misnomer, but this field exists to preserve compatibility with existing tools.
       * `scoreStdev` - The predicted standard deviation of the final score of the game after this move, in points. (NOTE: due to the mechanics of MCTS, this value will be **significantly biased high** currently, although it can still be informative as *relative* indicator).
@@ -533,6 +536,57 @@ This kind of setting could be interesting for handicap games or trying to elicit
 * Set `playoutDoublingAdvantage` also as desired or as typical for handicap games.
 * Set `useUncertainty` to `false` and `subtreeValueBiasFactor` to `0.0` and `useNoisePruning` to `false` (important, disables a few search features that add strength but are highly likely to interfere with this kind of weightful biasing).
    * Setting `useNoisePruning` to `false` is probably the most important of these - it adds the least strength in normal usage but might interfere the most. One could experiment with still enabling the other two for strength.
+
+## Forcing Minimum Visits to Specific Moves
+
+By default the analysis engine only spends visits on moves that the search considers worthwhile, and `allowMoves`/`avoidMoves` can only *restrict* the set of moves that are explored - they cannot *guarantee* that a move receives any visits. The `forceVisits` query field lets a query require that one or more root moves each receive at least a minimum number of visits, so that those moves are actually evaluated even if the search would never naturally explore them, **without distorting the root evaluation**.
+
+This is implemented using "weightless" visits (the same mechanism used internally for human-SL exploration and graph-search transpositions): a forced visit descends into the move and produces a real neural net evaluation for it (improving that move's own reported `winrate`/`scoreLead`/etc.), but it is not counted as a visit that the root "wanted", so it does not contribute to the root's aggregated value. Forced visits also do not consume the `maxVisits`/`maxPlayouts` budget (unless the search would have selected the move on its own anyway). See "Effect on the visit fields" below.
+
+### Query field
+
+See `forceVisits` in the query field list above. Example query (analyze the position normally with 1000 visits, but ensure `B5` gets at least 10 visits and `Q13` at least 3):
+
+```json
+{"id":"foo","moves":[],"rules":"tromp-taylor","komi":7.5,"boardXSize":19,"boardYSize":19,"maxVisits":1000,"forceVisits":[{"player":"B","moves":{"B5":10,"Q13":3}}]}
+```
+
+### How forced visits are scheduled
+
+Forced visits are interleaved with the normal search, in priority order:
+
+1. **Produce a root value first.** No forced visits are issued until the root position has been evaluated and a root value is available. This guarantees that forcing never delays the first usable evaluation (or the first `reportDuringSearchEvery` report).
+2. **Cover every forced move at least once.** Once a root value exists, each forced move is brought to at least 1 visit. After this step every forced move has a real evaluation.
+3. **Ramp up roughly proportionally over the life of the search.** Thereafter, each forced move's visit floor grows in proportion to the search's progress toward `maxVisits`. For a forced move `m` with minimum `T`, at the point where the root has `R` visits the engine targets approximately
+
+   ```
+   target(m) = clamp( ceil( T * R / maxVisits ), 1, T )
+   ```
+
+   visits for `m`, issuing forced visits only to make up any shortfall. For example, with `maxVisits=1000` and `forceVisits` of `B5=10`, you should expect roughly 2 visits to `B5` by the time the root reaches ~200 visits, ~5 visits by ~500 root visits, and the full 10 by the time the root reaches `maxVisits`. The search does not finish until the root has used up its natural budget **and** every forced minimum has been met (forced visits past the natural budget are driven straight to their full `T`).
+
+Naturally-selected visits count toward these targets: if the search would explore a forced move on its own, that move's visits accumulate the normal way and the engine forces only the remaining shortfall (often none). Forcing therefore never duplicates work the search was going to do anyway, and a forced move can never pollute the root value, because the root only ever aggregates visits it selected through normal search.
+
+### Effect on the visit fields
+
+The key distinction is between a move's own visits and the visits the root "wanted" to invest in it:
+
+   * `moveInfos[].visits` - total visits to the child node, **including** forced (weightless) visits. This is the count behind the move's reported `winrate`, `scoreLead`, `utility`, etc., so forcing more visits makes a forced move's own evaluation more accurate.
+   * `moveInfos[].edgeVisits` - the visits the root actually wanted to invest in the move via normal selection. Forced (weightless) visits do **not** increase this.
+   * `moveInfos[].weight` / `moveInfos[].edgeWeight` - the analogous total vs. root-wanted weights. Only `edgeWeight` enters the root aggregation.
+   * `rootInfo.visits` - counts only the visits that contribute to the root value (the root's own evaluation plus the per-move `edgeVisits`). It is **not** increased by forced visits.
+
+As a result, with `forceVisits` in effect you should expect:
+
+   * For a forced move the search would otherwise ignore: `edgeVisits` is `0` (or small), while `visits` equals the forced count. The move contributes **nothing** to `rootInfo`, and it sorts to the end of `moveInfos` (after all moves with `edgeVisits > 0`); look it up by `move` rather than by `order`.
+   * For a forced move the search also likes: `edgeVisits > 0` from natural selection and `visits >= edgeVisits`, with forcing topping up only the difference.
+   * `rootInfo.visits` is approximately 1 + the sum of `edgeVisits` over all moves, and therefore **`rootInfo.visits` will be less than the sum of `visits` over all moves** whenever forcing added visits beyond what the search selected naturally. The "extra" visits are the weightless forced ones, which evaluate the forced moves without being reflected in the root.
+
+Because forced visits are weightless, the `rootInfo` winrate/score/utility for a given root visit count are (up to ordinary search nondeterminism) the same as they would be for a query with no `forceVisits` at all.
+
+### Interaction with reportDuringSearchEvery
+
+Each partial report is a snapshot of the live tree and obeys the same relationships. In particular, at a report where `rootInfo.visits` is `R`, each forced move `m` should show approximately `target(m)` visits (at least 1, once a root value exists), and `rootInfo` will match what an unforced search would show at `R` root visits.
 
 ## Policy Queries
 

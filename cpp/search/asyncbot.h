@@ -46,6 +46,7 @@ class AsyncBot {
   void setKomiIfNew(float newKomi);
   void setRootHintLoc(Loc loc);
   void setAvoidMoveUntilByLoc(const std::vector<int>& bVec, const std::vector<int>& wVec);
+  void setRootForceVisitsByLoc(const std::vector<int64_t>& bVec, const std::vector<int64_t>& wVec);
   void setAvoidMoveUntilRescaleRoot(bool b);
   void setAlwaysIncludeOwnerMap(bool b);
   void setParams(const SearchParams& params);

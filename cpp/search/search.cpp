@@ -43,6 +43,8 @@ SearchThread::SearchThread(int tIdx, const Search& search)
    graphHash(search.rootGraphHash),
    graphPath(),
    shouldCountPlayout(false),
+   rootForceVisitReserved(false),
+   rootForceVisitReservedLoc(Board::NULL_LOC),
    rand(makeSeed(search,tIdx)),
    nnResultBuf(),
    statsBuf(),
@@ -76,6 +78,7 @@ Search::Search(const SearchParams& params, NNEvaluator* nnEval, NNEvaluator* hum
    rootGraphHash(),
    rootHintLoc(Board::NULL_LOC),
    avoidMoveUntilByLocBlack(),avoidMoveUntilByLocWhite(),avoidMoveUntilRescaleRoot(false),
+   rootForceVisitsByLocBlack(),rootForceVisitsByLocWhite(),
    rootSymmetries(),
    rootPruneOnlySymmetries(),
    rootSafeArea(NULL),
@@ -110,7 +113,8 @@ Search::Search(const SearchParams& params, NNEvaluator* nnEval, NNEvaluator* hum
    threadTasks(NULL),
    threadTasksRemaining(NULL),
    oldNNOutputsToCleanUpMutex(),
-   oldNNOutputsToCleanUp()
+   oldNNOutputsToCleanUp(),
+   forcingTopUpPhase(false)
 {
   testAssert(logger != NULL);
   nnXLen = nnEval->getNNXLen();
@@ -139,6 +143,8 @@ Search::Search(const SearchParams& params, NNEvaluator* nnEval, NNEvaluator* hum
   rootNode = NULL;
   nodeTable = new SearchNodeTable(params.nodeTableShardsPowerOfTwo);
   mutexPool = new MutexPool(nodeTable->mutexPool->getNumMutexes());
+  for(int i = 0; i<Board::MAX_ARR_SIZE; i++)
+    rootForceVisitReservationsByLoc[i].store(0,std::memory_order_relaxed);
 
   rootHistory.clear(rootBoard,rootPla,Rules(),0);
   rootKoHashTable->recompute(rootHistory);
@@ -225,6 +231,14 @@ void Search::setAvoidMoveUntilByLoc(const std::vector<int>& bVec, const std::vec
 
 void Search::setAvoidMoveUntilRescaleRoot(bool b) {
   avoidMoveUntilRescaleRoot = b;
+}
+
+void Search::setRootForceVisitsByLoc(const std::vector<int64_t>& bVec, const std::vector<int64_t>& wVec) {
+  if(rootForceVisitsByLocBlack == bVec && rootForceVisitsByLocWhite == wVec)
+    return;
+  clearSearch();
+  rootForceVisitsByLocBlack = bVec;
+  rootForceVisitsByLocWhite = wVec;
 }
 
 void Search::setRootHintLoc(Loc loc) {
@@ -467,6 +481,12 @@ void Search::runWholeSearch(
     (*searchBegun)();
   const int64_t numNonPlayoutVisits = getRootVisits();
 
+  //Forced root visits start out paced proportionally to the natural search; only switch to top-up mode
+  //(driving any remaining forced minimums to their full target) once the natural budget is exhausted.
+  forcingTopUpPhase.store(false,std::memory_order_relaxed);
+  for(int i = 0; i<Board::MAX_ARR_SIZE; i++)
+    rootForceVisitReservationsByLoc[i].store(0,std::memory_order_relaxed);
+
   //Compute caps on search
   int64_t maxVisits = pondering ? searchParams.maxVisitsPondering : searchParams.maxVisits;
   int64_t maxPlayouts = pondering ? searchParams.maxPlayoutsPondering : searchParams.maxPlayouts;
@@ -534,17 +554,27 @@ void Search::runWholeSearch(
         if(hasTc)
           tcMaxTimeLimit = tcMaxTime.load(std::memory_order_acquire);
 
-        bool shouldStop =
+        bool naturalStop =
           (numPlayouts >= maxPlayouts) ||
           (numPlayouts + numNonPlayoutVisits >= maxVisits);
 
         //Time limits cannot stop us from doing at least a little search so we have a non-null tree
         if(hasMaxTime && numPlayouts >= 2 && timeUsed >= maxTime)
-          shouldStop = true;
+          naturalStop = true;
         if(hasTc && numPlayouts >= 2 && timeUsed >= tcMaxTimeLimit)
-          shouldStop = true;
+          naturalStop = true;
         if(shouldStopEarly != NULL && (*shouldStopEarly)())
-          shouldStop = true;
+          naturalStop = true;
+
+        //Once the natural visit/time budget is exhausted, switch forced-visit scheduling into top-up mode so
+        //any remaining forced-move minimums get driven all the way to their target. Forced (weightless)
+        //playouts do not increment numPlayouts, so they do not extend the natural budget on their own.
+        if(naturalStop)
+          forcingTopUpPhase.store(true,std::memory_order_relaxed);
+
+        //We are not done until the natural budget is used up AND every forced-move minimum is satisfied.
+        //areForcedRootVisitsSatisfied() returns true immediately when no forced visits are configured.
+        bool shouldStop = naturalStop && areForcedRootVisitsSatisfied();
 
         //But an explicit stop signal can stop us from doing any search
         if(shouldStop || shouldStopNow.load(std::memory_order_relaxed)) {
@@ -1132,9 +1162,16 @@ bool Search::runSinglePlayout(SearchThread& thread, double upperBoundVisitsLeft)
 
   //Prep this value, playoutDescend will set it to false if the playout shouldn't count
   thread.shouldCountPlayout = true;
+  thread.rootForceVisitReserved = false;
+  thread.rootForceVisitReservedLoc = Board::NULL_LOC;
 
   bool finishedPlayout = playoutDescend(thread,*rootNode,true);
   (void)finishedPlayout;
+  if(thread.rootForceVisitReserved) {
+    rootForceVisitReservationsByLoc[thread.rootForceVisitReservedLoc].fetch_add(-1,std::memory_order_acq_rel);
+    thread.rootForceVisitReserved = false;
+    thread.rootForceVisitReservedLoc = Board::NULL_LOC;
+  }
 
   //Restore thread state back to the root state
   thread.pla = rootPla;
@@ -1224,10 +1261,15 @@ bool Search::playoutDescend(
   int bestChildIdx;
   Loc bestChildMoveLoc;
   bool countEdgeVisit;
+  bool skipPlayout;
 
   SearchNode* child = NULL;
   while(true) {
-    selectBestChildToDescend(thread,node,nodeState,numChildrenFound,bestChildIdx,bestChildMoveLoc,countEdgeVisit,isRoot);
+    selectBestChildToDescend(thread,node,nodeState,numChildrenFound,bestChildIdx,bestChildMoveLoc,countEdgeVisit,skipPlayout,isRoot);
+    if(skipPlayout) {
+      thread.shouldCountPlayout = false;
+      return false;
+    }
 
     //The absurdly rare case that the move chosen is not legal
     //(this should only happen either on a bug or where the nnHash doesn't have full legality information or when there's an actual hash collision).

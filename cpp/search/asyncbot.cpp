@@ -117,6 +117,10 @@ void AsyncBot::setAvoidMoveUntilByLoc(const std::vector<int>& bVec, const std::v
   stopAndWait();
   search->setAvoidMoveUntilByLoc(bVec,wVec);
 }
+void AsyncBot::setRootForceVisitsByLoc(const std::vector<int64_t>& bVec, const std::vector<int64_t>& wVec) {
+  stopAndWait();
+  search->setRootForceVisitsByLoc(bVec,wVec);
+}
 void AsyncBot::setAvoidMoveUntilRescaleRoot(bool b) {
   stopAndWait();
   search->setAvoidMoveUntilRescaleRoot(b);

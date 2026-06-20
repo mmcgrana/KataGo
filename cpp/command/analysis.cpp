@@ -47,6 +47,10 @@ struct AnalyzeRequest {
   vector<int> avoidMoveUntilByLocBlack;
   vector<int> avoidMoveUntilByLocWhite;
 
+  //Per-loc minimum forced visit counts at the root (0 = no minimum). Empty if not active.
+  vector<int64_t> rootForceVisitsByLocBlack;
+  vector<int64_t> rootForceVisitsByLocWhite;
+
   //Policy query: if non-empty, this request returns raw NN policies (no search). policyProfiles are the
   //requested profile keys (also the output map keys); policySuperhuman[i]/policyHumanProfiles[i] are the
   //resolved per-profile evaluation target (main net vs human net + profile).
@@ -253,8 +257,10 @@ int MainCmds::analysis(const vector<string>& args) {
     "reportDuringSearchEvery",
     "firstReportDuringSearchAfter",
     "priority",
+    "policyProfiles",
     "allowMoves",
-    "avoidMoves"
+    "avoidMoves",
+    "forceVisits"
   };
 
   ThreadSafeQueue<string*> toWriteQueue;
@@ -370,6 +376,7 @@ int MainCmds::analysis(const vector<string>& args) {
         bot->setAlwaysIncludeOwnerMap(request->includeOwnership || request->includeOwnershipStdev || request->includeMovesOwnership || request->includeMovesOwnershipStdev);
         bot->setParams(request->params);
         bot->setAvoidMoveUntilByLoc(request->avoidMoveUntilByLocBlack,request->avoidMoveUntilByLocWhite);
+        bot->setRootForceVisitsByLoc(request->rootForceVisitsByLocBlack,request->rootForceVisitsByLocWhite);
 
         //Policy query: only NN evaluations, no search. Returns one or more named policy arrays.
         if(!request->policyProfiles.empty()) {
@@ -686,6 +693,8 @@ int MainCmds::analysis(const vector<string>& args) {
       rbase.priority = 0;
       rbase.avoidMoveUntilByLocBlack.clear();
       rbase.avoidMoveUntilByLocWhite.clear();
+      rbase.rootForceVisitsByLocBlack.clear();
+      rbase.rootForceVisitsByLocWhite.clear();
 
       auto parseInteger = [&rbase,&reportErrorForId](const json& dict, const char* field, int64_t& buf, int64_t min, int64_t max, const char* errorMessage) {
         try {
@@ -1227,6 +1236,63 @@ int MainCmds::analysis(const vector<string>& args) {
           continue;
       }
 
+      if(input.find("forceVisits") != input.end()) {
+        json& forceParamsList = input["forceVisits"];
+        if(!forceParamsList.is_array()) {
+          reportErrorForId(rbase.id, "forceVisits", string("Must be a list of dicts with subfields 'player' and 'moves'"));
+          continue;
+        }
+        bool failed = false;
+        for(size_t i = 0; i<forceParamsList.size(); i++) {
+          json& forceParams = forceParamsList[i];
+          if(!forceParams.is_object() ||
+             forceParams.find("player") == forceParams.end() ||
+             forceParams.find("moves") == forceParams.end()) {
+            reportErrorForId(rbase.id, "forceVisits", string("Must be a list of dicts with subfields 'player' and 'moves'"));
+            failed = true;
+            break;
+          }
+
+          Player forcePla;
+          if(!parsePlayer(forceParams, "player", forcePla)) { failed = true; break; }
+
+          if(!forceParams["moves"].is_object()) {
+            reportErrorForId(rbase.id, "forceVisits", string("'moves' must be an object mapping board locations to a positive minimum visit count, e.g. {\"Q13\":3,\"R14\":10}"));
+            failed = true;
+            break;
+          }
+
+          vector<int64_t>& forceByLoc = forcePla == P_BLACK ? rbase.rootForceVisitsByLocBlack : rbase.rootForceVisitsByLocWhite;
+          if(forceByLoc.size() <= 0)
+            forceByLoc.resize(Board::MAX_ARR_SIZE, (int64_t)0);
+
+          for(auto it = forceParams["moves"].begin(); it != forceParams["moves"].end(); ++it) {
+            Loc loc;
+            if(!Location::tryOfString(it.key(), boardXSize, boardYSize, loc) || loc == Board::NULL_LOC) {
+              reportErrorForId(rbase.id, "forceVisits", "Could not parse board location: " + it.key());
+              failed = true;
+              break;
+            }
+            if(!it.value().is_number_integer()) {
+              reportErrorForId(rbase.id, "forceVisits", "Minimum visit count must be an integer for location: " + it.key());
+              failed = true;
+              break;
+            }
+            int64_t minVisits = it.value().get<int64_t>();
+            if(minVisits < 1 || minVisits > ((int64_t)1 << 50)) {
+              reportErrorForId(rbase.id, "forceVisits", "Minimum visit count must be an integer from 1 to 2^50 for location: " + it.key());
+              failed = true;
+              break;
+            }
+            forceByLoc[loc] = minVisits;
+          }
+          if(failed)
+            break;
+        }
+        if(failed)
+          continue;
+      }
+
 
       Board board(boardXSize,boardYSize);
       for(int i = 0; i<placements.size(); i++) {
@@ -1295,6 +1361,8 @@ int MainCmds::analysis(const vector<string>& args) {
           newRequest->priority = priority;
           newRequest->avoidMoveUntilByLocBlack = rbase.avoidMoveUntilByLocBlack;
           newRequest->avoidMoveUntilByLocWhite = rbase.avoidMoveUntilByLocWhite;
+          newRequest->rootForceVisitsByLocBlack = rbase.rootForceVisitsByLocBlack;
+          newRequest->rootForceVisitsByLocWhite = rbase.rootForceVisitsByLocWhite;
           newRequest->policyProfiles = rbase.policyProfiles;
           newRequest->policySuperhuman = rbase.policySuperhuman;
           newRequest->policyHumanProfiles = rbase.policyHumanProfiles;

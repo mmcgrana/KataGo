@@ -321,10 +321,149 @@ double Search::getFpuValueForChildrenAssumeVisited(
 }
 
 
+//Returns true if no forced root visits are configured for the root player, or if every configured forced
+//move that is legal at the root has already received at least its target number of (child) visits.
+bool Search::areForcedRootVisitsSatisfied() const {
+  const std::vector<int64_t>& forceByLoc = rootPla == P_BLACK ? rootForceVisitsByLocBlack : rootForceVisitsByLocWhite;
+  if(forceByLoc.size() < Board::MAX_ARR_SIZE)
+    return true;
+  const SearchNode* node = rootNode;
+  if(node == NULL)
+    return false;
+  SearchNodeState nodeState = node->state.load(std::memory_order_acquire);
+  if(nodeState < SearchNode::STATE_EXPANDED0)
+    return false;
+  const NNOutput* nnOutput = node->getNNOutput();
+  if(nnOutput == NULL)
+    return false;
+  const float* policyProbs = nnOutput->getPolicyProbsMaybeNoised();
+
+  ConstSearchNodeChildrenReference children = node->getChildren(nodeState);
+  int childrenCapacity = children.getCapacity();
+  for(Loc loc = 0; loc < Board::MAX_ARR_SIZE; loc++) {
+    int64_t target = forceByLoc[loc];
+    if(target <= 0)
+      continue;
+    //Skip moves that are not legal/searchable at the root; they can never accumulate visits.
+    if(policyProbs[getPos(loc)] < 0)
+      continue;
+    int64_t childVisits = 0;
+    for(int i = 0; i<childrenCapacity; i++) {
+      const SearchNode* child = children[i].getIfAllocated();
+      if(child == NULL)
+        break;
+      if(children[i].getMoveLocRelaxed() == loc) {
+        childVisits = child->stats.visits.load(std::memory_order_acquire);
+        break;
+      }
+    }
+    if(childVisits < target)
+      return false;
+  }
+  return true;
+}
+
+//If a forced root move is behind its current visit target, return it (to be searched weightlessly on this
+//playout). Returns Board::NULL_LOC if no forced move needs a visit right now, or if none are configured.
+//Sets shouldSkipPlayout to true only when forced-visit top-up is active and this thread has no assigned
+//under-target move, so it should yield instead of doing ordinary counted search past the natural budget.
+//
+//Scheduling (see Analysis_Engine.md "Forcing Minimum Visits to Specific Moves"):
+//  Priority 1: do nothing until the root itself has a value (rootVisits > 0), so forcing never delays it.
+//  Priority 2 & 3: target a running per-move visit count of clamp(ceil(target * rootVisits / maxVisits), 1, target),
+//    i.e. cover every forced move once as soon as a root value exists, then ramp up proportionally with the
+//    natural search. Once the natural budget is exhausted (forcingTopUpPhase), drive straight to the full target.
+//
+//Threads reserve one scheduled forced visit before descending, like normal search reserves work
+//against a shared visit budget when playouts finish. This lets many threads work on one forced move
+//when it has a large remaining deficit, while avoiding a thundering herd beyond that deficit.
+Loc Search::chooseForcedRootMove(const SearchNode& node, SearchThread& thread, bool& shouldSkipPlayout) const {
+  shouldSkipPlayout = false;
+  Player pla = thread.pla;
+  const std::vector<int64_t>& forceByLoc = pla == P_BLACK ? rootForceVisitsByLocBlack : rootForceVisitsByLocWhite;
+  if(forceByLoc.size() < Board::MAX_ARR_SIZE)
+    return Board::NULL_LOC;
+  const NNOutput* nnOutput = node.getNNOutput();
+  if(nnOutput == NULL)
+    return Board::NULL_LOC;
+  const float* policyProbs = nnOutput->getPolicyProbsMaybeNoised();
+
+  bool topUp = forcingTopUpPhase.load(std::memory_order_relaxed);
+  int64_t rootVisits = node.stats.visits.load(std::memory_order_acquire);
+  //Priority 1: establish a root value before spending any visits on forced moves.
+  if(rootVisits <= 0 && !topUp)
+    return Board::NULL_LOC;
+
+  int64_t maxV = searchParams.maxVisits;
+  if(maxV < 1)
+    maxV = 1;
+
+  SearchNodeState nodeState = node.state.load(std::memory_order_acquire);
+  ConstSearchNodeChildrenReference children = node.getChildren(nodeState);
+  int childrenCapacity = children.getCapacity();
+
+  int threadIdx = thread.threadIdx;
+  if(threadIdx < 0)
+    threadIdx = 0;
+
+  if(thread.rootForceVisitReserved)
+    return thread.rootForceVisitReservedLoc;
+
+  int start = threadIdx % Board::MAX_ARR_SIZE;
+  for(int offset = 0; offset < Board::MAX_ARR_SIZE; offset++) {
+    Loc loc = (Loc)((start + offset) % Board::MAX_ARR_SIZE);
+    int64_t target = forceByLoc[loc];
+    if(target <= 0)
+      continue;
+    if(policyProbs[getPos(loc)] < 0)
+      continue;
+    int64_t childVisits = 0;
+    for(int i = 0; i<childrenCapacity; i++) {
+      const SearchNode* child = children[i].getIfAllocated();
+      if(child == NULL)
+        break;
+      if(children[i].getMoveLocRelaxed() == loc) {
+        childVisits = child->stats.visits.load(std::memory_order_acquire);
+        break;
+      }
+    }
+    int64_t desired;
+    if(topUp)
+      desired = target;
+    else {
+      desired = (int64_t)ceil((double)target * (double)rootVisits / (double)maxV);
+      if(desired < 1) desired = 1;
+      if(desired > target) desired = target;
+    }
+    if(childVisits >= desired)
+      continue;
+
+    std::atomic<int64_t>& reservations = rootForceVisitReservationsByLoc[loc];
+    int64_t reservedVisits = reservations.load(std::memory_order_acquire);
+    while(childVisits + reservedVisits < desired) {
+      if(childVisits <= 0 && reservedVisits > 0)
+        break;
+      if(reservations.compare_exchange_weak(
+           reservedVisits, reservedVisits + 1,
+           std::memory_order_acq_rel, std::memory_order_acquire
+      )) {
+        thread.rootForceVisitReserved = true;
+        thread.rootForceVisitReservedLoc = loc;
+        return loc;
+      }
+    }
+  }
+  //No forced visit can be reserved. Before top-up, let this thread do a natural playout. During
+  //top-up, the natural budget has already been exhausted, so do no work.
+  if(topUp)
+    shouldSkipPlayout = true;
+  return Board::NULL_LOC;
+}
+
 void Search::selectBestChildToDescend(
   SearchThread& thread, const SearchNode& node, SearchNodeState nodeState,
   int& numChildrenFound, int& bestChildIdx, Loc& bestChildMoveLoc, bool& countEdgeVisit,
-  bool isRoot) const
+  bool& skipPlayout, bool isRoot) const
 {
   assert(thread.pla == node.nextPla);
 
@@ -332,9 +471,46 @@ void Search::selectBestChildToDescend(
   bestChildIdx = -1;
   bestChildMoveLoc = Board::NULL_LOC;
   countEdgeVisit = true;
+  skipPlayout = false;
 
   ConstSearchNodeChildrenReference children = node.getChildren(nodeState);
   int childrenCapacity = children.getCapacity();
+
+  //Forced root visits: if a user-specified move is behind its current visit target, search it weightlessly.
+  //Such a visit gives the child node a real evaluation but is NOT counted as an edge visit (so it does not
+  //bias the root's aggregated value) and does NOT count against the visit/playout budget (shouldCountPlayout
+  //is cleared, like the weightless human-SL and passing-hack visits).
+  if(isRoot) {
+    bool shouldSkipPlayout = false;
+    Loc forceLoc = chooseForcedRootMove(node, thread, shouldSkipPlayout);
+    if(shouldSkipPlayout) {
+      numChildrenFound = 0;
+      bestChildIdx = -1;
+      bestChildMoveLoc = Board::NULL_LOC;
+      countEdgeVisit = false;
+      skipPlayout = true;
+      thread.shouldCountPlayout = false;
+      return;
+    }
+    if(forceLoc != Board::NULL_LOC) {
+      int numAllocated = 0;
+      int forcedIdx = -1;
+      for(int i = 0; i<childrenCapacity; i++) {
+        const SearchNode* child = children[i].getIfAllocated();
+        if(child == NULL)
+          break;
+        if(children[i].getMoveLocRelaxed() == forceLoc)
+          forcedIdx = i;
+        numAllocated++;
+      }
+      numChildrenFound = numAllocated;
+      bestChildIdx = forcedIdx >= 0 ? forcedIdx : numAllocated;
+      bestChildMoveLoc = forceLoc;
+      countEdgeVisit = false;
+      thread.shouldCountPlayout = false;
+      return;
+    }
+  }
 
   double policyProbMassVisited = 0.0;
   double maxChildWeight = 0.0;

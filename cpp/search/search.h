@@ -54,6 +54,8 @@ struct SearchThread {
   //Tracks whether this thread did something that "should" be counted as a playout
   //for the purpose of playout limits
   bool shouldCountPlayout;
+  bool rootForceVisitReserved;
+  Loc rootForceVisitReservedLoc;
 
   Rand rand;
 
@@ -94,6 +96,14 @@ struct Search {
   std::vector<int> avoidMoveUntilByLocBlack;
   std::vector<int> avoidMoveUntilByLocWhite;
   bool avoidMoveUntilRescaleRoot; // When avoiding moves at the root, rescale the root policy to sum to 1.
+
+  //External user-specified moves that should each receive at least a minimum number of visits at the root,
+  //regardless of whether the search would naturally explore them. Empty if not active, else of length
+  //MAX_ARR_SIZE with the per-move minimum visit count at each loc (0 = no minimum). These forced visits are
+  //"weightless": they evaluate the move (giving the child node real visits) but are not counted as edge
+  //visits, so they do not contribute to the root's aggregated value. See Search::chooseForcedRootMove.
+  std::vector<int64_t> rootForceVisitsByLocBlack;
+  std::vector<int64_t> rootForceVisitsByLocWhite;
 
   //If rootSymmetryPruning==true and the board is symmetric, mask all the equivalent copies of each move except one.
   bool rootSymDupLoc[Board::MAX_ARR_SIZE];
@@ -174,6 +184,12 @@ struct Search {
   std::mutex oldNNOutputsToCleanUpMutex;
   std::vector<std::shared_ptr<NNOutput>*> oldNNOutputsToCleanUp;
 
+  //For forced root visits (rootForceVisitsByLoc*). Set true once the natural visit/time budget is exhausted,
+  //which switches forced-visit scheduling from proportional pacing into "top-up" mode that drives any
+  //remaining forced-move minimums all the way to their targets. Reset at the start of each search.
+  std::atomic<bool> forcingTopUpPhase;
+  mutable std::atomic<int64_t> rootForceVisitReservationsByLoc[Board::MAX_ARR_SIZE];
+
   //================================================================================================================
   // Constructors and Destructors
   // search.cpp
@@ -225,6 +241,7 @@ struct Search {
   void setKomiIfNew(float newKomi); //Does not clear history, does clear search unless komi is equal.
   void setRootHintLoc(Loc hintLoc);
   void setAvoidMoveUntilByLoc(const std::vector<int>& bVec, const std::vector<int>& wVec);
+  void setRootForceVisitsByLoc(const std::vector<int64_t>& bVec, const std::vector<int64_t>& wVec);
   void setAvoidMoveUntilRescaleRoot(bool b);
   void setAlwaysIncludeOwnerMap(bool b);
   void setRootSymmetryPruningOnly(const std::vector<int>& rootPruneOnlySymmetries);
@@ -607,8 +624,20 @@ private:
   void selectBestChildToDescend(
     SearchThread& thread, const SearchNode& node, SearchNodeState nodeState,
     int& numChildrenFound, int& bestChildIdx, Loc& bestChildMoveLoc, bool& countEdgeVisit,
-    bool isRoot
+    bool& skipPlayout, bool isRoot
   ) const;
+
+  //Forced root visits (rootForceVisitsByLoc*). Returns true if no forced visits are configured for the root
+  //player, or if every configured forced move has already received at least its target number of visits.
+  bool areForcedRootVisitsSatisfied() const;
+  //If a forced root move is behind its current visit target, returns it (to be searched weightlessly this
+  //playout). Returns Board::NULL_LOC if no forced move needs a visit right now, or if none are configured.
+  //Sets shouldSkipPlayout to true only when forced-visit top-up is active and this thread has no
+  //assigned under-target move, so the caller can yield instead of falling back to normal search after
+  //the natural visit budget is exhausted.
+  //The selected forced move is reserved before returning, so concurrent threads can work on the same
+  //move up to its remaining scheduled deficit without piling beyond it.
+  Loc chooseForcedRootMove(const SearchNode& node, SearchThread& thread, bool& shouldSkipPlayout) const;
 
   //----------------------------------------------------------------------------------------
   // Update of node values during search
